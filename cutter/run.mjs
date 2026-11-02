@@ -1,10 +1,10 @@
 // Command-line entry for one cutter run:
-//   node cutter/run.mjs --model ecmwf --out ./out [--cycle auto|<ISO>] [--dry-run]
+//   node cutter/run.mjs --model ecmwf|icon --out ./out [--cycle auto|<ISO>] [--dry-run]
 //
-// The heavy build is the laptop's own ECMWF cycle builder, given a temporary
-// data folder. This file only chooses the cycle, runs that builder, packages
-// the result and checks it. Every network call goes through an injectable
-// fetch so tests never touch the real network.
+// The heavy build is the laptop's own cycle builder, given a temporary data
+// folder. This file only chooses the cycle, runs that builder, packages the
+// result and checks it. Every network call goes through an injectable fetch so
+// tests never touch the real network.
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -16,10 +16,13 @@ import {
   ECMWF_DEFAULT_MAX_STEP,
   ECMWF_MAX_AVAILABLE_STEP,
 } from '../server/wxPackEcmwf.mjs'
+import { createWxPackIcon } from '../server/wxPackIcon.mjs'
 import { getCandidateCycles } from '../src/lib/wxPack/ecmwfPack.ts'
+import { candidateIconCycles, ICON_DEFAULT_STEPS } from '../src/lib/wxPack/iconPack.ts'
+import { buildIconUrls, fetchIconWithFallback } from '../src/lib/wxPack/iconUrls.ts'
 import { buildForecastSteps } from '../server/wxPack.mjs'
 import { packageCycle, verifyPackage } from './package-cycle.mjs'
-import { ECMWF_MODEL_TITLE, ecmwfAttribution } from './attribution.mjs'
+import { ECMWF_MODEL_TITLE, ICON_MODEL_TITLE, ecmwfAttribution, DWD_ATTRIBUTION } from './attribution.mjs'
 
 const ECMWF_BASE = 'https://data.ecmwf.int/forecasts'
 
@@ -27,6 +30,10 @@ const MODELS = {
   ecmwf: {
     title: ECMWF_MODEL_TITLE,
     attribution: () => ecmwfAttribution(),
+  },
+  icon: {
+    title: ICON_MODEL_TITLE,
+    attribution: () => DWD_ATTRIBUTION,
   },
 }
 
@@ -87,6 +94,35 @@ export async function findNewestCompleteCycle({ nowMs = Date.now(), fetchImpl })
 }
 
 /**
+ * Cheap completeness probe for one ICON cycle, the same check the laptop makes:
+ * HEAD the last needed file (2 m temperature at the last forecast step), trying
+ * DWD's current address first and its older address second.
+ */
+export async function probeIconCycleComplete(cycleUtc, fetchImpl) {
+  const maxStep = ICON_DEFAULT_STEPS[ICON_DEFAULT_STEPS.length - 1]
+  const urls = buildIconUrls({ cycleUtc, varDir: 't_2m', varName: 'T_2M', stepHours: maxStep })
+  try {
+    const { res } = await fetchIconWithFallback({
+      newUrl: urls.newUrl,
+      oldUrl: urls.oldUrl,
+      fetchFn: (url) => fetchWithTimeout(fetchImpl, url, { method: 'HEAD' }),
+    })
+    return Boolean(res && res.ok)
+  } catch {
+    return false
+  }
+}
+
+/** The newest candidate ICON cycle whose last forecast file is present. */
+export async function findNewestCompleteIconCycle({ nowMs = Date.now(), fetchImpl }) {
+  if (typeof fetchImpl !== 'function') throw new Error('findNewestCompleteIconCycle needs a fetch')
+  for (const cycle of candidateIconCycles(nowMs, 3)) {
+    if (await probeIconCycleComplete(cycle, fetchImpl)) return cycle
+  }
+  return null
+}
+
+/**
  * Wrap a fetch so the laptop builder sees only the requested cycle as newest:
  * probes for later cycles answer 404. Data requests pass through unchanged.
  */
@@ -134,7 +170,9 @@ function readIndex(dir) {
  * Run the laptop cycle builder into a temporary data folder.
  * @returns {Promise<{ cycleUtc: string, cycleDir: string, index: object }>}
  */
-export async function buildCycle({ cycleUtc, dataDir, fetchImpl }) {
+export async function buildCycle({ model = 'ecmwf', cycleUtc, dataDir, fetchImpl }) {
+  if (model === 'icon') return buildIconCycle({ cycleUtc, dataDir, fetchImpl })
+
   const pack = createWxPack({ dataDir, modelId: 'ecmwf' })
   const selectedFetch = cycleUtc ? cycleSelectionFetch(cycleUtc, fetchImpl) : fetchImpl
   await withBuildOutputOnStderr(() => refreshCycle(pack, selectedFetch))
@@ -151,6 +189,26 @@ export async function buildCycle({ cycleUtc, dataDir, fetchImpl }) {
     throw new Error(`requested ${cycleUtc} but the builder produced ${found.cycleUtc}`)
   }
   return found
+}
+
+/**
+ * Run the laptop ICON builder for one named cycle. The builder derives the
+ * regrid lookup from the cycle's CLAT and CLON files; no lookup file is passed.
+ */
+async function buildIconCycle({ cycleUtc, dataDir, fetchImpl }) {
+  const pack = createWxPackIcon({ dataDir })
+  const built = await withBuildOutputOnStderr(() => pack.runCycleJob({ cycleUtc, fetchImpl }))
+  if (!built.published) {
+    const detail = built.errors?.length ? `: ${built.errors.join('; ')}` : ''
+    throw new Error(`no complete cycle was built${cycleUtc ? ` for ${cycleUtc}` : ''}${detail}`)
+  }
+  if (cycleUtc && Date.parse(built.cycleUtc) !== Date.parse(cycleUtc)) {
+    throw new Error(`requested ${cycleUtc} but the builder produced ${built.cycleUtc}`)
+  }
+  const cycleDir = path.join(pack.root, built.dir)
+  const index = readIndex(cycleDir)
+  if (!index) throw new Error(`icon pack has no index in ${cycleDir}`)
+  return { cycleUtc: built.cycleUtc, cycleDir, index }
 }
 
 /**
@@ -193,7 +251,10 @@ export async function runCut({
 
   let cycleUtc = cycle
   if (cycleUtc === 'auto') {
-    cycleUtc = await findNewestCompleteCycle({ nowMs, fetchImpl })
+    cycleUtc =
+      model === 'icon'
+        ? await findNewestCompleteIconCycle({ nowMs, fetchImpl })
+        : await findNewestCompleteCycle({ nowMs, fetchImpl })
     if (!cycleUtc) throw new Error('no complete cycle is available yet')
   } else if (!Number.isFinite(Date.parse(cycleUtc))) {
     throw new Error(`not a cycle time: ${cycleUtc}`)
@@ -201,7 +262,7 @@ export async function runCut({
 
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wxcut-data-'))
   try {
-    const built = await buildCycle({ cycleUtc, dataDir, fetchImpl })
+    const built = await buildCycle({ model, cycleUtc, dataDir, fetchImpl })
 
     const result = packageCycle({
       cycleDir: built.cycleDir,

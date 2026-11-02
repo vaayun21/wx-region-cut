@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { decideWork, retentionDeletes } from './plan-run.mjs'
-import { findNewestCompleteCycle } from './run.mjs'
+import { findNewestCompleteCycle, findNewestCompleteIconCycle } from './run.mjs'
 
 const TAG_RE = /^(ecmwf|icon)-(\d{4})(\d{2})(\d{2})T(\d{2})Z$/
 
@@ -71,9 +71,8 @@ export async function decideModels({
   if (model === 'auto' || model === 'ecmwf') {
     newestComplete.ecmwf = await findNewestCompleteCycle({ nowMs, fetchImpl })
   }
-  if (model === 'icon') {
-    // The ICON side of the cutter is not part of this stage.
-    newestComplete.icon = null
+  if (model === 'auto' || model === 'icon') {
+    newestComplete.icon = await findNewestCompleteIconCycle({ nowMs, fetchImpl })
   }
 
   let models
