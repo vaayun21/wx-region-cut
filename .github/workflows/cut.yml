@@ -44,7 +44,7 @@ jobs:
       - name: List existing release tags
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release list --limit 200 --json tagName,createdAt,isDraft > releases.json
+        run: gh release list --limit 200 --json tagName,createdAt,publishedAt,isDraft > releases.json
 
       - name: Choose the models that need a build
         id: pick
@@ -163,7 +163,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release list --limit 200 --json tagName,createdAt,isDraft > releases-now.json
+          gh release list --limit 200 --json tagName,createdAt,publishedAt,isDraft > releases-now.json
           node cutter/decide.mjs --latest --releases releases-now.json > latest.json
           cat latest.json
           if gh release view latest >/dev/null 2>&1; then
@@ -176,7 +176,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release list --limit 200 --json tagName,createdAt,isDraft > releases-now.json
+          gh release list --limit 200 --json tagName,createdAt,publishedAt,isDraft > releases-now.json
           node cutter/decide.mjs --retention --releases releases-now.json > delete.json
           node --input-type=module -e '
           import fs from "node:fs";

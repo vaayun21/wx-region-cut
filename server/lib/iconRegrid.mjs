@@ -38,6 +38,14 @@ export {
   decodeIconGrib2,
 }
 
+/** True when any target point has no ICON cell. ICON covers the whole globe, so a good lookup has none. */
+export function lookupHasGaps(lookup) {
+  for (let i = 0; i < lookup.length; i++) {
+    if (lookup[i] === 0xffffffff) return true
+  }
+  return false
+}
+
 /**
  * Loads lookup from cache if present and valid; otherwise builds, caches, and returns it.
  * @param {{cachePath: string, cellLats?: Float32Array, cellLons?: Float32Array, gridIdentity: string, targetGrid?: import('../../src/lib/wxPack/iconRegrid.ts').ForecastGrid}} options
@@ -53,7 +61,8 @@ export function getOrBuildLookup({ cachePath, cellLats, cellLons, gridIdentity, 
         meta.nx === targetGrid.nx &&
         meta.ny === targetGrid.ny &&
         meta.minLat === targetGrid.minLat &&
-        meta.minLon === targetGrid.minLon
+        meta.minLon === targetGrid.minLon &&
+        !lookupHasGaps(lookup)
       ) {
         return lookup
       }

@@ -8,6 +8,13 @@ import { fileURLToPath } from 'node:url'
 import { decideWork, retentionDeletes } from './plan-run.mjs'
 import { findNewestCompleteCycle, findNewestCompleteIconCycle } from './run.mjs'
 
+/** When a release went out: its publish time (the creation time of a release is the date of the commit it was cut from, which can be days old). */
+export function releaseTimeMs(release) {
+  const published = Date.parse(release?.publishedAt)
+  if (Number.isFinite(published) && published > Date.parse('2020-01-01T00:00:00Z')) return published
+  return Date.parse(release?.createdAt)
+}
+
 const TAG_RE = /^(ecmwf|icon)-(\d{4})(\d{2})(\d{2})T(\d{2})Z$/
 
 /** Turn release tags such as ecmwf-20261103T00Z into cycle ISO strings. */
@@ -37,7 +44,7 @@ export function latestPointerFromReleases({ releases, nowMs = Date.now() }) {
     const match = typeof tag === 'string' ? tag.match(TAG_RE) : null
     if (!match) continue
     const cycleUtc = `${match[2]}-${match[3]}-${match[4]}T${match[5]}:00:00Z`
-    const builtAtMs = Date.parse(release.createdAt)
+    const builtAtMs = releaseTimeMs(release)
     const best = models[match[1]]
     if (!best || Date.parse(cycleUtc) > Date.parse(best.cycleUtc)) {
       models[match[1]] = { tag, cycleUtc, builtAtMs: Number.isFinite(builtAtMs) ? builtAtMs : null }
@@ -96,7 +103,7 @@ export function retentionFromReleases({ releases, nowMs = Date.now(), keepDays =
     const tag = release?.tagName ?? release?.tag
     const createdAtMs = Number.isFinite(release?.createdAtMs)
       ? release.createdAtMs
-      : Date.parse(release?.createdAt)
+      : releaseTimeMs(release)
     if (typeof tag === 'string') rows.push({ tag, createdAtMs })
   }
   // Never delete the newest published run of a model, even when it is older than keepDays: the
