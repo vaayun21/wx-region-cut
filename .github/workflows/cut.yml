@@ -1,0 +1,215 @@
+# Build one small per-field weather package per model run and publish it as a
+# GitHub release. Runs every half hour at off-minutes, and on demand.
+name: cut
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Model to build
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - ecmwf
+          - icon
+      force:
+        description: Build even when this cycle is already published
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cut
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      models: ${{ steps.pick.outputs.models }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '24'
+
+      - name: List existing release tags
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release list --limit 200 --json tagName,createdAt,isDraft > releases.json
+
+      - name: Choose the models that need a build
+        id: pick
+        env:
+          INPUT_MODEL: ${{ github.event.inputs.model || 'auto' }}
+          INPUT_FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          node cutter/decide.mjs --releases releases.json --model "$INPUT_MODEL" --force "$INPUT_FORCE" > decision.json
+          cat decision.json
+          node --input-type=module -e '
+          import fs from "node:fs";
+          const d = JSON.parse(fs.readFileSync("decision.json", "utf8"));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, "models=" + JSON.stringify(d.models) + "\n");
+          '
+
+  cut:
+    needs: decide
+    if: ${{ needs.decide.outputs.models != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJSON(needs.decide.outputs.models) }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Build the cycle package
+        run: node cutter/run.mjs --model "${{ matrix.model }}" --out ./out > run.json
+
+      - name: Read the build result
+        run: |
+          cat run.json
+          node --input-type=module -e '
+          import fs from "node:fs";
+          const r = JSON.parse(fs.readFileSync("run.json", "utf8"));
+          const m = JSON.parse(fs.readFileSync("out/manifest.json", "utf8"));
+          const lines = ["TAG=" + r.tag, "CYCLE=" + r.cycleUtc, "BUILT_AT=" + m.builtAtMs];
+          fs.appendFileSync(process.env.GITHUB_ENV, lines.join("\n") + "\n");
+          '
+
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$TAG" --draft --title "$TAG" --notes "Automated model run for $CYCLE"
+
+      - name: Upload the field assets, then the manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for asset in out/*.wgrz; do
+            [ -e "$asset" ] || continue
+            gh release upload "$TAG" "$asset"
+          done
+          gh release upload "$TAG" out/manifest.json
+
+      - name: Check the uploaded assets against the manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p verify
+          gh release download "$TAG" -p manifest.json -D verify
+          gh release view "$TAG" --json assets > assets.json
+          node --input-type=module -e '
+          import fs from "node:fs";
+          const manifest = JSON.parse(fs.readFileSync("verify/manifest.json", "utf8"));
+          const assets = JSON.parse(fs.readFileSync("assets.json", "utf8")).assets;
+          const sizes = new Map(assets.map((a) => [a.name, a.size]));
+          const bad = [];
+          for (const field of manifest.fields) {
+            const got = sizes.get(field.asset);
+            if (got !== field.bytes) bad.push(field.asset + ": expected " + field.bytes + ", got " + got);
+          }
+          if (!sizes.has("manifest.json")) bad.push("manifest.json: missing");
+          if (bad.length) {
+            console.error(bad.join("\n"));
+            process.exit(1);
+          }
+          console.log("checked " + manifest.fields.length + " assets");
+          '
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$TAG" --draft=false --latest=false
+
+      - name: Delete the draft release on failure
+        if: ${{ failure() && env.TAG != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ "$is_draft" = "true" ]; then
+            gh release delete "$TAG" --cleanup-tag --yes
+          fi
+
+  # One job writes the rolling pointer and prunes old runs AFTER every model job has finished,
+  # so two models finishing together can never overwrite each other's entry. The pointer is
+  # computed from the published releases themselves, never from the previous pointer file.
+  pointer:
+    needs: [decide, cut]
+    if: ${{ always() && needs.decide.outputs.models != '[]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Write latest.json from the published releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt,isDraft > releases-now.json
+          node cutter/decide.mjs --latest --releases releases-now.json > latest.json
+          cat latest.json
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest latest.json --clobber
+          else
+            gh release create latest --title latest --notes "Rolling pointer to the newest released runs" latest.json
+          fi
+
+      - name: Delete releases older than three days
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt,isDraft > releases-now.json
+          node cutter/decide.mjs --retention --releases releases-now.json > delete.json
+          node --input-type=module -e '
+          import fs from "node:fs";
+          const d = JSON.parse(fs.readFileSync("delete.json", "utf8"));
+          process.stdout.write(d.delete.join("\n") + (d.delete.length ? "\n" : ""));
+          ' > delete.txt
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            gh release delete "$tag" --cleanup-tag --yes || true
+          done < delete.txt
+
+  keepalive:
+    needs: [decide, cut, pointer]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Keep the workflow enabled
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow enable cut.yml || true
+
+      - name: Commit a monthly keep-alive file
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > keepalive.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt
+            if ! git diff --cached --quiet; then
+              git commit -m "Keep the scheduled job active"
+              git push
+            fi
+          fi
