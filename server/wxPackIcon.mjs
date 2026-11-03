@@ -335,13 +335,13 @@ export function createWxPackIcon({
 
         const outFilePath = path.join(dest, fieldDef.id, `${step}.wgr1`)
 
+        const isDeaccumulated = fieldDef.id === 'rain3' || fieldDef.id === 'conv3'
+
         // Resume partial cycles: reuse existing on-disk grid file if valid
-        if (fs.existsSync(outFilePath)) {
+        if (!isDeaccumulated && fs.existsSync(outFilePath)) {
           try {
             const existingBytes = fs.readFileSync(outFilePath)
             const decoded = decodeWgr1(existingBytes)
-            if (fieldDef.id === 'rain3') lastTotPrec = decoded.planes[0]
-            if (fieldDef.id === 'conv3') lastConv = decoded.planes[0]
             converted.push({
               fieldId: fieldDef.id,
               stepHours: step,

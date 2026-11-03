@@ -22,6 +22,32 @@ export interface EcmwfFieldMapping {
   conversion: (v: number) => number
 }
 
+/** Gust parameter name at the steps where IFS publishes the plain gust field. */
+export const ECMWF_GUST_PARAM = '10fg'
+/** Gust parameter name at steps 93 to 144: maximum gust over the preceding 3 hours. */
+export const ECMWF_GUST3_PARAM = '10fg3'
+/** Pack steps whose 6-hour gust must be built from the two 3-hour windows ending at S and S-3. */
+export const ECMWF_GUST3_STEPS: readonly number[] = Object.freeze([96, 102, 108, 114, 120, 126, 132, 138, 144])
+
+export function isEcmwfGust3Step(stepHours: number): boolean {
+  return ECMWF_GUST3_STEPS.includes(stepHours)
+}
+
+/**
+ * Cell-by-cell maximum of two consecutive 3-hour maximum-gust windows.
+ * SAFETY: a lone 3-hour maximum understates the 6-hour pack step, so both are required.
+ */
+export function combineGust3Planes(current: Float32Array, previous: Float32Array): Float32Array {
+  if (current.length !== previous.length) {
+    throw new Error(`gust window length mismatch: ${current.length} vs ${previous.length}`)
+  }
+  const out = new Float32Array(current.length)
+  for (let i = 0; i < current.length; i++) {
+    out[i] = current[i] > previous[i] ? current[i] : previous[i]
+  }
+  return out
+}
+
 export const ECMWF_FIELDS: readonly EcmwfFieldMapping[] = Object.freeze([
   { id: 'wind10', param: '10u', category: 2, number: 2, levelType: 103, levelValue: 10, pairWith: '10v', conversion: (v: number) => v },
   { id: 'wind10', param: '10v', category: 2, number: 3, levelType: 103, levelValue: 10, pairWith: '10u', conversion: (v: number) => v },
@@ -42,7 +68,7 @@ export const ECMWF_FIELDS: readonly EcmwfFieldMapping[] = Object.freeze([
   { id: 'wind200', param: 'u', category: 2, number: 2, levelType: 100, levelValue: 20000, pairWith: 'v', conversion: (v: number) => v },
   { id: 'wind200', param: 'v', category: 2, number: 3, levelType: 100, levelValue: 20000, pairWith: 'u', conversion: (v: number) => v },
 
-  { id: 'gust', param: '10fg', category: 2, number: 22, levelType: 1, levelValue: 0, conversion: (v: number) => v },
+  { id: 'gust', param: ECMWF_GUST_PARAM, category: 2, number: 22, levelType: 1, levelValue: 0, conversion: (v: number) => v },
 
   { id: 'temp2', param: '2t', category: 0, number: 0, levelType: 103, levelValue: 2, conversion: (v: number) => v },
   { id: 'dewpt', param: '2d', category: 0, number: 6, levelType: 103, levelValue: 2, conversion: (v: number) => v },

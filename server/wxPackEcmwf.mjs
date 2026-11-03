@@ -11,6 +11,10 @@ import {
   ECMWF_MAX_AVAILABLE_STEP,
   ECMWF_DEFAULT_MAX_STEP,
   ECMWF_DEFAULT_STEPS,
+  ECMWF_GUST3_PARAM,
+  ECMWF_GUST3_STEPS,
+  isEcmwfGust3Step,
+  combineGust3Planes,
   convertEcmwfFieldPlanes,
   synthesizeEcmwfStep0,
   computeEcmwfThunder,
@@ -26,6 +30,10 @@ export {
   ECMWF_MAX_AVAILABLE_STEP,
   ECMWF_DEFAULT_MAX_STEP,
   ECMWF_DEFAULT_STEPS,
+  ECMWF_GUST3_PARAM,
+  ECMWF_GUST3_STEPS,
+  isEcmwfGust3Step,
+  combineGust3Planes,
   convertEcmwfFieldPlanes,
   synthesizeEcmwfStep0,
   computeEcmwfThunder,
@@ -113,6 +121,8 @@ export async function refreshCycle(pack, fetchImpl) {
 
   let totalBytes = 0
   let totalRequests = 0
+  let gust3ExtraBytes = 0
+  let gust3ExtraRequests = 0
   const convertedFiles = []
   let cycleOk = true
 
@@ -150,11 +160,12 @@ export async function refreshCycle(pack, fetchImpl) {
       const def = packFieldById(fieldMap.id)
       const outFile = path.join(outDir, fieldMap.id, `${step}.wgr1`)
 
-      if (fs.existsSync(outFile)) {
+      const isDeaccumulated = fieldMap.id === 'rain3' || fieldMap.id === 'conv3'
+      const isGust3 = fieldMap.id === 'gust' && isEcmwfGust3Step(step)
+
+      if (!isDeaccumulated && fs.existsSync(outFile)) {
         const buf = fs.readFileSync(outFile)
         const grid = decodeWgr1(buf)
-        if (fieldMap.id === 'rain3') lastTp = grid.planes[0]
-        if (fieldMap.id === 'conv3') lastCp = grid.planes[0]
         stepFiles.push({
           fieldId: fieldMap.id,
           stepHours: step,
@@ -168,7 +179,24 @@ export async function refreshCycle(pack, fetchImpl) {
       }
 
       const targetEntries = []
-      if (fieldMap.pairWith) {
+      if (isGust3) {
+         // Steps 96..144 publish the gust as 10fg3, a maximum over the preceding
+         // 3 hours. The 6-hour pack step needs both 3-hour windows, cell by cell.
+         const levTypeKey = 'sfc'
+         const entry = indexEntries.find(e => e.param === ECMWF_GUST3_PARAM && e.levtype === levTypeKey)
+         if (!entry) continue
+
+         const prevStep = step - 3
+         const prevIndexEntries = await fetchEcmwfIndex(cycleUtc, prevStep, fetchImpl)
+         totalRequests++
+         const prevEntry = prevIndexEntries?.find(e => e.param === ECMWF_GUST3_PARAM && e.levtype === levTypeKey)
+         if (!prevEntry) continue
+
+         const prevBase = `${dateStr}${runStr}0000-${prevStep}h-oper-fc.grib2`
+         const prevUrl = `${ECMWF_BASE}/${dateStr}/${runStr}z/ifs/0p25/oper/${prevBase}`
+         targetEntries.push({ ...fieldMap, entry, _url: grib2Url })
+         targetEntries.push({ ...fieldMap, entry: prevEntry, _url: prevUrl, _gust3Previous: true })
+      } else if (fieldMap.pairWith) {
          const param1 = ECMWF_FIELDS.find(f => f.id === fieldMap.id && f.number === 2).param // u component
          const param2 = ECMWF_FIELDS.find(f => f.id === fieldMap.id && f.number === 3).param // v component
          const levTypeKey = fieldMap.levelType === 103 ? 'sfc' : 'pl'
@@ -197,12 +225,16 @@ export async function refreshCycle(pack, fetchImpl) {
       for (const t of targetEntries) {
          const range = `${t.entry._offset}-${t.entry._offset + t.entry._length - 1}`
          await sleep(1000)
-         const gribRes = await fetchWithRetry(grib2Url, range, fetchImpl)
+         const gribRes = await fetchWithRetry(t._url ?? grib2Url, range, fetchImpl)
          totalRequests++
          if (!gribRes || !gribRes.ok) continue
 
          const buf = new Uint8Array(await gribRes.arrayBuffer())
          totalBytes += buf.length
+         if (t._gust3Previous) {
+           gust3ExtraBytes += buf.length
+           gust3ExtraRequests++
+         }
 
          let decoded
          try {
@@ -217,16 +249,25 @@ export async function refreshCycle(pack, fetchImpl) {
 
          const { values } = cropIfsToGfs(field, t.conversion)
          planes.push(values)
-         validTimeIso = field.validTimeIso
-         referenceTimeIso = field.referenceTimeIso
+         // The current step (first entry) supplies the valid time; a gust 3-hour
+         // window from S-3 must not move the pack file's valid time backwards.
+         if (validTimeIso == null) {
+           validTimeIso = field.validTimeIso
+           referenceTimeIso = field.referenceTimeIso
+         }
       }
 
-      if (planes.length !== def.planes) continue
+      let sourcePlanes = planes
+      if (isGust3) {
+        if (planes.length !== 2) continue
+        sourcePlanes = [combineGust3Planes(planes[0], planes[1])]
+      }
+      if (sourcePlanes.length !== def.planes) continue
 
       const convRes = convertEcmwfFieldPlanes({
         fieldId: fieldMap.id,
         stepHours: step,
-        planes,
+        planes: sourcePlanes,
         referenceTimeIso,
         validTimeIso,
         lastTp,
@@ -257,40 +298,27 @@ export async function refreshCycle(pack, fetchImpl) {
     const hasCape = stepFiles.some(f => f.fieldId === 'cape' && f.stepHours === step)
     if (hasConv3 && hasCape) {
       const thundrOut = path.join(outDir, 'thundr', `${step}.wgr1`)
-      if (fs.existsSync(thundrOut)) {
-        const buf = fs.readFileSync(thundrOut)
-        const grid = decodeWgr1(buf)
-        stepFiles.push({
-          fieldId: 'thundr',
-          stepHours: step,
-          bytes: buf.length,
-          min: grid.meta.min,
-          max: grid.meta.max,
-        })
-        seenFields.add('thundr')
-      } else {
-        const convBuf = fs.readFileSync(path.join(outDir, 'conv3', `${step}.wgr1`))
-        const capeBuf = fs.readFileSync(path.join(outDir, 'cape', `${step}.wgr1`))
-        const convDec = decodeWgr1(convBuf)
-        const capeDec = decodeWgr1(capeBuf)
-        const thundrRes = computeEcmwfThunder({
-          conv3Decoded: convDec,
-          capeDecoded: capeDec,
-          box: FORECAST_BOX,
-        })
-        const thundrDef = packFieldById('thundr')
-        atomicWrite(thundrOut, thundrRes.wgr1)
-        stepFiles.push({
-          fieldId: 'thundr',
-          stepHours: step,
-          unit: thundrDef.unit,
-          levelLabel: thundrDef.levelLabel,
-          bytes: thundrRes.bytes,
-          min: thundrRes.min,
-          max: thundrRes.max,
-        })
-        seenFields.add('thundr')
-      }
+      const convBuf = fs.readFileSync(path.join(outDir, 'conv3', `${step}.wgr1`))
+      const capeBuf = fs.readFileSync(path.join(outDir, 'cape', `${step}.wgr1`))
+      const convDec = decodeWgr1(convBuf)
+      const capeDec = decodeWgr1(capeBuf)
+      const thundrRes = computeEcmwfThunder({
+        conv3Decoded: convDec,
+        capeDecoded: capeDec,
+        box: FORECAST_BOX,
+      })
+      const thundrDef = packFieldById('thundr')
+      atomicWrite(thundrOut, thundrRes.wgr1)
+      stepFiles.push({
+        fieldId: 'thundr',
+        stepHours: step,
+        unit: thundrDef.unit,
+        levelLabel: thundrDef.levelLabel,
+        bytes: thundrRes.bytes,
+        min: thundrRes.min,
+        max: thundrRes.max,
+      })
+      seenFields.add('thundr')
     }
 
     if (!seenFields.has('wind10') || !seenFields.has('temp2')) {
@@ -342,7 +370,10 @@ export async function refreshCycle(pack, fetchImpl) {
     fs.rmSync(path.join(pack.root, old), { recursive: true, force: true })
   }
 
-  console.log(`[ECMWF] Published cycle ${cycleUtc}, ${totalRequests} requests, ${totalBytes} bytes`)
+  console.log(
+    `[ECMWF] Published cycle ${cycleUtc}, ${totalRequests} requests, ${totalBytes} bytes` +
+      ` (gust 3-hour extra: ${gust3ExtraRequests} ranges, ${gust3ExtraBytes} bytes)`,
+  )
 }
 
 export function startEcmwfRefresh(pack, fetchImpl = globalThis.fetch) {
