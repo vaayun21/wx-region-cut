@@ -214,3 +214,88 @@ jobs:
               git push
             fi
           fi
+
+  # Second copy of the same release layout on a public dataset repository.
+  # Every step is skipped while the secret and variable are unset, so the cut
+  # keeps working before the mirror is configured. A mirror failure is allowed:
+  # the release copy has already been published by the jobs above.
+  mirror:
+    needs: [pointer]
+    permissions:
+      contents: read
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_MIRROR_REPO: ${{ vars.HF_MIRROR_REPO }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+
+      - uses: actions/setup-python@v5.4.0
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        with:
+          python-version: '3.12'
+
+      - name: Install the dataset client
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        run: python -m pip install -q huggingface_hub
+
+      - name: List the release tags
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release list --limit 200 --json tagName,createdAt,publishedAt,isDraft > releases.json
+
+      - name: List the mirror folders
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        run: python cutter/mirror-hf.py list > mirror.json
+
+      - name: Plan the mirror changes
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        run: |
+          node cutter/mirror-plan.mjs --github releases.json --mirror mirror.json > mirror-plan.json
+          cat mirror-plan.json
+          node --input-type=module -e '
+          import fs from "node:fs";
+          const plan = JSON.parse(fs.readFileSync("mirror-plan.json", "utf8"));
+          fs.writeFileSync("upload.txt", plan.upload.join("\n") + (plan.upload.length ? "\n" : ""));
+          fs.writeFileSync("remove.txt", plan.remove.join("\n") + (plan.remove.length ? "\n" : ""));
+          '
+
+      - name: Upload the new model runs
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            mkdir -p "mirror-assets/$tag"
+            gh release download "$tag" -D "mirror-assets/$tag"
+            python cutter/mirror-hf.py upload-folder --tag "$tag" --folder "mirror-assets/$tag"
+          done < upload.txt
+
+      - name: Upload the latest pointer last
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p mirror-latest
+          gh release download latest -p latest.json -D mirror-latest --clobber
+          python cutter/mirror-hf.py upload-file --local mirror-latest/latest.json --path-in-repo latest/latest.json
+
+      - name: Remove the expired model runs
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        run: |
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            python cutter/mirror-hf.py delete-folder --tag "$tag"
+          done < remove.txt
+
+
+      - name: Free the space of deleted files once a day
+        if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}
+        run: |
+          if [ "$(date -u +%H)" = "03" ]; then
+            python cutter/mirror-hf.py squash || true
+          fi
