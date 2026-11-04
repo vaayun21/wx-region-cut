@@ -220,7 +220,9 @@ jobs:
   # keeps working before the mirror is configured. A mirror failure is allowed:
   # the release copy has already been published by the jobs above.
   mirror:
-    needs: [pointer]
+    needs: [decide, pointer]
+    # Runs on every tick, also when nothing was cut, so the copy fills at once after setup and catches up after a failure.
+    if: ${{ always() && needs.decide.result == 'success' }}
     permissions:
       contents: read
     continue-on-error: true
@@ -280,9 +282,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p mirror-latest
-          gh release download latest -p latest.json -D mirror-latest --clobber
-          python cutter/mirror-hf.py upload-file --local mirror-latest/latest.json --path-in-repo latest/latest.json
+          # Only when a run was added or the pointer is missing, so idle ticks write nothing.
+          if [ -s upload.txt ] || ! grep -q '"latest"' mirror.json; then
+            mkdir -p mirror-latest
+            gh release download latest -p latest.json -D mirror-latest --clobber
+            python cutter/mirror-hf.py upload-file --local mirror-latest/latest.json --path-in-repo latest/latest.json
+          fi
 
       - name: Remove the expired model runs
         if: ${{ env.HF_TOKEN != '' && env.HF_MIRROR_REPO != '' }}

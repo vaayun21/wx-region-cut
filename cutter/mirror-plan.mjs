@@ -53,20 +53,19 @@ export function planMirrorSync({ githubTags = [], mirrorTags = [] } = {}) {
   }
 }
 
-function readTagList(file) {
-  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
-  if (Array.isArray(parsed)) {
-    return parsed.map((row) =>
-      typeof row === 'string' ? row : row?.tagName ?? row?.tag ?? row?.name,
-    )
-  }
-  if (Array.isArray(parsed?.releases)) return readTagListFromArray(parsed.releases)
-  if (Array.isArray(parsed?.tags)) return parsed.tags
-  throw new Error(`${file} does not hold a tag list`)
+/** Tag names from release rows; a draft is a run still being built, so it is never copied. */
+export function tagsFromRows(rows) {
+  return rows
+    .filter((row) => !(row && typeof row === 'object' && row.isDraft === true))
+    .map((row) => (typeof row === 'string' ? row : row?.tagName ?? row?.tag ?? row?.name))
 }
 
-function readTagListFromArray(rows) {
-  return rows.map((row) => (typeof row === 'string' ? row : row?.tagName ?? row?.tag ?? row?.name))
+function readTagList(file) {
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (Array.isArray(parsed)) return tagsFromRows(parsed)
+  if (Array.isArray(parsed?.releases)) return tagsFromRows(parsed.releases)
+  if (Array.isArray(parsed?.tags)) return parsed.tags
+  throw new Error(`${file} does not hold a tag list`)
 }
 
 function parseArgs(argv) {
